@@ -138,7 +138,7 @@ def load_camera(name, index, directory):
     paths = [os.path.join(directory, f'{name}.npz'), os.path.join(directory, f'{name}_ground.npz')]
     for p in paths:
         if not os.path.exists(p):
-            sys.exit(f"Error: {p} not found. Run CalibrateIntrinsics.py and CalibrateGround.py for '{name}'.")
+            sys.exit(f"Error: {p} not found. Run CalibrateGUI.py and CalibrateGround.py for '{name}'.")
     intr, ground = np.load(paths[0]), np.load(paths[1])
     size = tuple(int(v) for v in intr['size'])
     cam = {'name': name, 'K': intr['K'], 'D': intr['D'], 'fisheye': bool(intr['fisheye']),

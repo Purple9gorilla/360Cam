@@ -24,14 +24,13 @@ python Calibration\Capture.py
 Corrects lens distortion. Hold a printed checkerboard in front of the camera and tilt and move it around, covering the edges and corners. Frames save automatically.
 
 ```
-python Calibration\CalibrateIntrinsics.py --pinhole --names 0=front 1=rear
+python Calibration\CalibrateGUI.py
 ```
-- With no `--camera`, it shows every connected camera in one grid. Press a camera's number key to calibrate it. When it finishes (or you press Backspace), you return to the grid, and calibrated cameras are marked. Press `q` to quit.
-- To calibrate a single camera directly, use `--camera 0 --name front`.
-- `--names INDEX=NAME ...` sets the file names in the grid. Unnamed cameras are called `cam<index>`.
-- Use `--pinhole` for lenses up to about 120°. Leave it off for real fisheye lenses (about 160–190°).
-- `--board COLS ROWS` is the number of inner corners (default 9 6). `--square` is the square size in mm.
-- Auto-saves when the board has moved at least `--min-move` px and `--interval` seconds have passed, then calibrates after `--frames` frames (default 20). SPACE forces a save, `c` calibrates now, `q` quits.
+- Set the options in the left panel, then click **Find cameras**. Every connected camera appears in one grid. Click a camera (or press its number key) to calibrate it. When it finishes (or you press Backspace), you return to the grid, and calibrated cameras are marked.
+- **Names** (`0=front 1=rear`) sets the output file names. Unnamed cameras are called `cam<index>`.
+- Tick **Pinhole** for lenses up to about 120°. Leave it off for real fisheye lenses (about 160–190°).
+- **Inner corners** is the number of inner checkerboard corners (default 9 × 6). **Square size** is in mm.
+- Auto-saves when the board has moved at least *Min corner movement* px and *Min seconds between saves* have passed, then calibrates after *Frames* frames (default 20). SPACE forces a save, `c` calibrates now, Backspace goes back.
 - Sanity check: the printed RMS should be under about 1px, and the focal length should be near `(width / 2) / tan(HFOV / 2)` (about 540px for a 100° lens at 1280px wide).
 - Output: `calib\<name>.npz`.
 
@@ -77,7 +76,7 @@ Renders four simulated cameras around a virtual car looking at a tile floor.
 |---|---|
 | `Calibration\Capture.py` | Single camera live view |
 | `Calibration\MultiCapture.py` | All cameras in one grid |
-| `Calibration\CalibrateIntrinsics.py` | Lens calibration, saves frames automatically |
+| `Calibration\CalibrateGUI.py` | Lens calibration GUI, saves frames automatically |
 | `Calibration\PreviewUndistort.py` | Raw vs undistorted preview |
 | `Calibration\CalibrateGround.py` | Ground-plane homography per camera |
 | `BirdsEye.py` | Stitches the cameras into the live top-down view |

@@ -29,7 +29,7 @@ def main():
 
     path = os.path.join(args.dir, f'{args.name or f"cam{args.camera}"}.npz')
     if not os.path.exists(path):
-        print(f"Error: {path} not found. Run CalibrateIntrinsics.py first.")
+        print(f"Error: {path} not found. Run CalibrateGUI.py first.")
         sys.exit(1)
     data = np.load(path)
     K, D, size, fisheye = data['K'], data['D'], tuple(int(v) for v in data['size']), bool(data['fisheye'])
