@@ -1,436 +1,407 @@
-import base64
-import math
-import os
+"""Tkinter interface for Windows fisheye camera calibration."""
+
+import queue
+import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 
-os.environ.setdefault('OPENCV_LOG_LEVEL', 'ERROR')  # quiet DSHOW warnings when probing missing camera indices
 import cv2
-import numpy as np
+from PIL import Image, ImageTk
 
-DEFAULT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'calib')
-MIN_FRAMES = 10
-MAX_PROBE = 10
-PREVIEW_RESOLUTIONS = [(640, 480), (320, 240)]
-TILE_W, TILE_H = 480, 270
-MAX_VIEW_W = 960
-TICK_MS = 10
+from pathlib import Path
 
+from calibration import MIN_SAMPLES, calibrate, find_corners, load_calibration, make_maps, save_calibration
+from camera_devices import discover_cameras
 
-def find_corners(gray, board):
-    flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_FAST_CHECK
-    found, corners = cv2.findChessboardCorners(gray, board, flags)
-    if not found:
-        return None
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
-    return cv2.cornerSubPix(gray, corners, (3, 3), (-1, -1), criteria)
+CALIB_DIR = Path(__file__).resolve().parent.parent / "calib"
 
 
-def calibrate(obj_points, img_points, size, fisheye):
-    if fisheye:
-        K = np.zeros((3, 3))
-        D = np.zeros((4, 1))
-        # OpenCV 5 moved these flags from cv2.fisheye to cv2
-        ns = cv2.fisheye if hasattr(cv2.fisheye, 'CALIB_FIX_SKEW') else cv2
-        flags = (ns.CALIB_RECOMPUTE_EXTRINSIC | ns.CALIB_CHECK_COND | ns.CALIB_FIX_SKEW)
-        rms, K, D, _, _ = cv2.fisheye.calibrate(
-            [o.reshape(-1, 1, 3) for o in obj_points], img_points, size, K, D, flags=flags,
-            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6))
-    else:
-        rms, K, D, _, _ = cv2.calibrateCamera(obj_points, img_points, size, None, None)
-    return rms, K, D
+class CameraWorker(threading.Thread):
+    def __init__(self, events):
+        super().__init__(daemon=True)
+        self.events = events
+        self.commands = queue.Queue()
+        self.frames = queue.Queue(maxsize=1)
+
+    def run(self):
+        capture = None
+        token = 0
+        try:
+            while True:
+                try:
+                    try:
+                        command, value, token = self.commands.get(timeout=0.02 if capture is None else 0)
+                    except queue.Empty:
+                        command = None
+                    if command is not None and capture is not None:
+                        capture.release()
+                        capture = None
+                    if command == "stop":
+                        break
+                    if command == "open":
+                        capture = cv2.VideoCapture(value, cv2.CAP_DSHOW)
+                        if not capture.isOpened():
+                            capture.release()
+                            capture = None
+                            self.events.put(("camera_error", token, "Could not open the selected camera."))
+                    if capture is None:
+                        continue
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        capture.release()
+                        capture = None
+                        self.events.put(("camera_error", token, "Camera stopped delivering frames."))
+                        continue
+                    try:
+                        self.frames.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.frames.put((token, frame))
+                    time.sleep(0.01)
+                except Exception as exc:
+                    if capture is not None:
+                        capture.release()
+                        capture = None
+                    self.events.put(("camera_error", token, f"Camera worker failed: {exc}"))
+        finally:
+            if capture is not None:
+                capture.release()
 
 
-def find_indices():
-    indices = []
-    for i in range(MAX_PROBE):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened() and cap.read()[0]:
-            indices.append(i)
-        cap.release()
-    return indices
-
-
-def open_previews(indices):
-    # Several USB cameras often can't all stream at high resolution, so step down until all open.
-    for width, height in PREVIEW_RESOLUTIONS:
-        caps = {}
-        for i in indices:
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            if cap.isOpened() and cap.read()[0]:
-                caps[i] = cap
-            else:
-                cap.release()
-        if len(caps) == len(indices):
-            return caps
-        for cap in caps.values():
-            cap.release()
-    return {}
-
-
-def make_tile(index, name, frame, done):
-    if frame is None:
-        tile = np.zeros((TILE_H, TILE_W, 3), np.uint8)
-    else:
-        tile = cv2.resize(frame, (TILE_W, TILE_H))
-    color = (0, 200, 0) if done else (0, 255, 255)
-    label = f'[{index}] {name}' + ('  CALIBRATED' if done else '')
-    cv2.putText(tile, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    cv2.rectangle(tile, (0, 0), (TILE_W - 1, TILE_H - 1), color, 2)
-    return tile
-
-
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title('Intrinsic Calibration')
-        self.mode = 'idle'  # idle | picker | calib
-        self.photo = None
-        self.pending_key = None
-        self.sess = {}
-
-        self.vars = {
-            'names': tk.StringVar(),
-            'cols': tk.StringVar(value='9'),
-            'rows': tk.StringVar(value='6'),
-            'square': tk.StringVar(value='25.0'),
-            'width': tk.StringVar(value='1280'),
-            'height': tk.StringVar(value='720'),
-            'pinhole': tk.BooleanVar(value=False),
-            'out': tk.StringVar(value=DEFAULT_DIR),
-            'frames': tk.StringVar(value='20'),
-            'interval': tk.StringVar(value='1.0'),
-            'min_move': tk.StringVar(value='40.0'),
-        }
-        self.done = set()
+class Application:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Fisheye camera calibration")
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.events = queue.Queue()
+        self.worker = CameraWorker(self.events)
+        self.worker.start()
+        self.cameras = []
+        self.camera = None
+        self.token = 0
+        self.generation = 0
+        self.frame = None
+        self.frame_size = None
+        self.samples = []
+        self.calibration = None
+        self.maps = None
+        self.busy = False
+        self.scanning = False
+        self.closed = False
+        self.camera_var = tk.StringVar()
+        self.columns = tk.StringVar(value="9")
+        self.rows = tk.StringVar(value="6")
+        self.status = tk.StringVar(value="Scanning for cameras...")
+        self.sample_status = tk.StringVar(value="Samples: 0 (10 minimum; 15+ recommended)")
+        self.identity = tk.StringVar(value="No camera selected.")
+        self.result = tk.StringVar(value="Undistorted preview unavailable until calibrated.")
         self._build()
-        self.bind_all('<Key>', self._on_key)
-        self.protocol('WM_DELETE_WINDOW', self._close)
+        self.columns.trace_add("write", self.pattern_changed)
+        self.rows.trace_add("write", self.pattern_changed)
+        self.refresh()
+        self.timer = self.root.after(30, self.poll)
 
-    # ---------- layout ----------
     def _build(self):
-        v = self.vars
-        side = ttk.Frame(self)
-        side.grid(row=0, column=0, sticky='ns', padx=6, pady=6)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(3, weight=1)
+        controls = ttk.Frame(self.root, padding=8)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+        ttk.Label(controls, text="Camera:").grid(row=0, column=0, sticky="w")
+        self.dropdown = ttk.Combobox(controls, textvariable=self.camera_var, state="readonly", width=70)
+        self.dropdown.grid(row=0, column=1, sticky="ew", padx=5)
+        self.dropdown.bind("<<ComboboxSelected>>", self.select_camera)
+        ttk.Button(controls, text="Refresh", command=self.refresh).grid(row=0, column=2)
+        ttk.Label(controls, textvariable=self.identity, wraplength=1100).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=4
+        )
+        options = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        options.grid(row=1, column=0, sticky="ew")
+        ttk.Label(options, text="Checkerboard inner corners: columns").pack(side="left")
+        ttk.Entry(options, textvariable=self.columns, width=4).pack(side="left", padx=4)
+        ttk.Label(options, text="rows").pack(side="left")
+        ttk.Entry(options, textvariable=self.rows, width=4).pack(side="left", padx=4)
+        ttk.Button(options, text="Capture view", command=self.capture).pack(side="left", padx=4)
+        ttk.Button(options, text="Reset samples", command=self.reset_samples).pack(side="left", padx=4)
+        ttk.Button(options, text="Calibrate", command=self.start_calibration).pack(side="left", padx=4)
+        ttk.Button(options, text="Save", command=self.save).pack(side="left", padx=4)
+        ttk.Button(options, text="Load", command=self.load).pack(side="left", padx=4)
+        info = ttk.Frame(self.root, padding=(8, 0))
+        info.grid(row=2, column=0, sticky="ew")
+        ttk.Label(info, textvariable=self.sample_status).pack(anchor="w")
+        ttk.Label(info, textvariable=self.result).pack(anchor="w")
+        preview = ttk.Frame(self.root, padding=8)
+        preview.grid(row=3, column=0, sticky="nsew")
+        preview.columnconfigure((0, 1), weight=1, uniform="preview")
+        preview.rowconfigure(1, weight=1)
+        ttk.Label(preview, text="Distorted / original").grid(row=0, column=0)
+        ttk.Label(preview, text="Undistorted").grid(row=0, column=1)
+        self.original = ttk.Label(preview, anchor="center", text="No camera frame")
+        self.corrected = ttk.Label(preview, anchor="center", text="Not calibrated")
+        self.original.grid(row=1, column=0, sticky="nsew")
+        self.corrected.grid(row=1, column=1, sticky="nsew")
+        ttk.Label(self.root, textvariable=self.status, padding=8, wraplength=1100).grid(
+            row=4, column=0, sticky="ew"
+        )
 
-        cams = ttk.LabelFrame(side, text='Cameras')
-        cams.pack(fill='x', pady=3)
-        self._row(cams, 0, 'Names (0=front 1=rear)', v['names'], 16)
+    def run_job(self, kind, token, function):
+        def work():
+            try:
+                self.events.put((kind, token, function(), None))
+            except Exception as exc:
+                self.events.put((kind, token, None, str(exc)))
+        threading.Thread(target=work, daemon=True).start()
 
-        board = ttk.LabelFrame(side, text='Checkerboard')
-        board.pack(fill='x', pady=3)
-        self._row(board, 0, 'Inner corners (cols)', v['cols'])
-        self._row(board, 1, 'Inner corners (rows)', v['rows'])
-        self._row(board, 2, 'Square size (mm)', v['square'])
+    def refresh(self):
+        if self.scanning:
+            return
+        self.scanning = True
+        self.token += 1
+        self.worker.commands.put(("close", None, self.token))
+        self.camera = None
+        self.frame = None
+        self.frame_size = None
+        self.camera_var.set("")
+        self.dropdown["values"] = ()
+        self.identity.set("No camera selected.")
+        self.clear_state()
+        self.clear_previews()
+        self.status.set("Scanning for Windows cameras...")
+        self.run_job("discovery", self.token, discover_cameras)
 
-        cap = ttk.LabelFrame(side, text='Capture')
-        cap.pack(fill='x', pady=3)
-        self._row(cap, 0, 'Width', v['width'])
-        self._row(cap, 1, 'Height', v['height'])
-        self._row(cap, 2, 'Frames to auto-calibrate', v['frames'])
-        self._row(cap, 3, 'Min seconds between saves', v['interval'])
-        self._row(cap, 4, 'Min corner movement (px)', v['min_move'])
-        ttk.Checkbutton(cap, text='Pinhole model (default fisheye)', variable=v['pinhole']).grid(
-            row=5, column=0, columnspan=2, sticky='w', padx=6, pady=2)
+    def select_camera(self, _event=None):
+        index = self.dropdown.current()
+        if index < 0:
+            return
+        self.token += 1
+        self.camera = self.cameras[index]
+        self.frame = None
+        self.frame_size = None
+        self.clear_state()
+        self.clear_previews()
+        self.identity.set(
+            f"Enumerated device instance: {self.camera.instance_id or 'unavailable'} | "
+            f"Hardware IDs: {', '.join(self.camera.hardware_ids) or 'unavailable'} | "
+            "Index-to-device mapping is assumed, not verified. Refresh and visually verify."
+        )
+        self.status.set("Opening camera...")
+        self.worker.commands.put(("open", self.camera.index, self.token))
 
-        out = ttk.LabelFrame(side, text='Output folder')
-        out.pack(fill='x', pady=3)
-        ttk.Entry(out, textvariable=v['out'], width=24).grid(row=0, column=0, padx=6, pady=3)
-        ttk.Button(out, text='...', width=3, command=self._browse).grid(row=0, column=1, padx=3)
+    def pattern(self):
+        try:
+            pattern = (int(self.columns.get()), int(self.rows.get()))
+        except ValueError as exc:
+            raise ValueError("Enter whole numbers for checkerboard inner corners.") from exc
+        if min(pattern) < 2 or max(pattern) > 100:
+            raise ValueError("Checkerboard inner-corner counts must be between 2 and 100.")
+        return pattern
 
-        self.find_btn = ttk.Button(side, text='Find cameras', command=self._find_cameras)
-        self.find_btn.pack(fill='x', pady=(8, 2))
-        self.save_btn = ttk.Button(side, text='Save frame (Space)', command=lambda: self._press(' '),
-                                   state='disabled')
-        self.save_btn.pack(fill='x', pady=2)
-        self.calib_btn = ttk.Button(side, text='Calibrate now (c)', command=lambda: self._press('c'),
-                                    state='disabled')
-        self.calib_btn.pack(fill='x', pady=2)
-        self.back_btn = ttk.Button(side, text='Back / Stop (Backspace)', command=lambda: self._press('back'),
-                                   state='disabled')
-        self.back_btn.pack(fill='x', pady=2)
+    def pattern_changed(self, *_):
+        self.clear_state()
+        self.status.set("Checkerboard settings changed; capture new samples.")
 
-        main = ttk.Frame(self)
-        main.grid(row=0, column=1, sticky='nsew', padx=6, pady=6)
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(0, weight=1)
-        main.rowconfigure(0, weight=1)
-        main.columnconfigure(0, weight=1)
+    def clear_state(self):
+        self.generation += 1
+        self.samples = []
+        self.calibration = None
+        self.maps = None
+        self.busy = False
+        self.sample_status.set(f"Samples: 0 ({MIN_SAMPLES} minimum; 15+ recommended)")
+        self.result.set("Undistorted preview unavailable until calibrated.")
+        self.corrected.configure(image="", text="Not calibrated")
+        self.corrected.image = None
 
-        self.view = tk.Label(main, bg='black', width=80, height=24, fg='white',
-                             text='Click "Find cameras" to begin')
-        self.view.grid(row=0, column=0, sticky='nsew')
-        self.view.bind('<Button-1>', self._on_click)
-        self.log = scrolledtext.ScrolledText(main, height=7, state='disabled')
-        self.log.grid(row=1, column=0, sticky='ew', pady=(6, 0))
+    def reset_samples(self):
+        self.clear_state()
+        self.status.set("Samples and calibration cleared.")
 
-    @staticmethod
-    def _row(parent, row, label, var, width=8):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky='w', padx=6, pady=2)
-        ttk.Entry(parent, textvariable=var, width=width).grid(row=row, column=1, sticky='w', padx=6, pady=2)
+    def clear_previews(self):
+        for label, text in ((self.original, "No camera frame"), (self.corrected, "Not calibrated")):
+            label.configure(image="", text=text)
+            label.image = None
 
-    def _browse(self):
-        path = filedialog.askdirectory(initialdir=self.vars['out'].get() or DEFAULT_DIR)
+    def capture(self):
+        if self.busy:
+            return
+        try:
+            pattern = self.pattern()
+            if self.frame is None:
+                raise ValueError("Select an active camera before capturing a view.")
+        except ValueError as exc:
+            messagebox.showerror("Capture", str(exc))
+            return
+        frame = self.frame.copy()
+        self.busy = True
+        self.status.set("Finding checkerboard corners...")
+        self.run_job("capture", self.generation, lambda: find_corners(frame, pattern))
+
+    def start_calibration(self):
+        if self.busy:
+            return
+        try:
+            pattern = self.pattern()
+            if self.frame_size is None or self.camera is None:
+                raise ValueError("Select an active camera first.")
+            if len(self.samples) < MIN_SAMPLES:
+                raise ValueError(f"Capture at least {MIN_SAMPLES} valid views first.")
+        except ValueError as exc:
+            messagebox.showerror("Calibration", str(exc))
+            return
+        samples = list(self.samples)
+        size = self.frame_size
+        camera = self.camera
+        self.busy = True
+        self.status.set("Calibrating; please wait...")
+        self.run_job("calibration", self.generation, lambda: calibrate(
+            samples, pattern, size, camera.device_path, camera.instance_id
+        ))
+
+    def save(self):
+        if self.calibration is None:
+            messagebox.showerror("Save calibration", "Calibrate or load a calibration first.")
+            return
+        CALIB_DIR.mkdir(exist_ok=True)
+        path = filedialog.asksaveasfilename(
+            initialdir=CALIB_DIR, initialfile="calibration.json",
+            defaultextension=".json", filetypes=[("JSON", "*.json")],
+        )
         if path:
-            self.vars['out'].set(os.path.normpath(path))
+            try:
+                save_calibration(path, self.calibration)
+                self.status.set(f"Saved calibration to {path}")
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Save calibration", str(exc))
 
-    def _log(self, text):
-        self.log.config(state='normal')
-        self.log.insert('end', text + '\n')
-        self.log.see('end')
-        self.log.config(state='disabled')
-
-    def _show(self, img):
-        h, w = img.shape[:2]
-        if w > MAX_VIEW_W:
-            img = cv2.resize(img, (MAX_VIEW_W, int(h * MAX_VIEW_W / w)))
-        ok, buf = cv2.imencode('.png', img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-        if ok:
-            self.photo = tk.PhotoImage(data=base64.b64encode(buf.tobytes()))
-            self.view.config(image=self.photo, text='', width=0, height=0)
-
-    def _reset_view(self, text):
-        self.photo = None
-        self.view.config(image='', text=text, width=80, height=24)
-
-    def _set_mode(self, mode):
-        self.mode = mode
-        calib = mode == 'calib'
-        self.find_btn.config(state='normal' if mode == 'idle' else 'disabled')
-        self.back_btn.config(state='disabled' if mode == 'idle' else 'normal')
-        self.save_btn.config(state='normal' if calib else 'disabled')
-        self.calib_btn.config(state='normal' if calib else 'disabled')
-
-    # ---------- settings ----------
-    def _settings(self):
-        v = {k: var.get() for k, var in self.vars.items()}
-        names = {}
-        for item in v['names'].split():
-            index, _, name = item.partition('=')
-            if not (index.isdigit() and name):
-                raise ValueError(f"'{item}' should look like 0=front")
-            names[int(index)] = name
-        return {
-            'names': names,
-            'board': (int(v['cols']), int(v['rows'])),
-            'square': float(v['square']),
-            'width': int(v['width']),
-            'height': int(v['height']),
-            'pinhole': v['pinhole'],
-            'out': v['out'].strip() or DEFAULT_DIR,
-            'frames': int(v['frames']),
-            'interval': float(v['interval']),
-            'min_move': float(v['min_move']),
-        }
-
-    # ---------- input ----------
-    def _press(self, key):
-        self.pending_key = key
-
-    def _on_key(self, event):
-        if isinstance(self.focus_get(), (tk.Entry, ttk.Entry)):
+    def load(self):
+        if self.camera is None or self.frame_size is None:
+            messagebox.showerror("Load calibration", "Select an active camera first.")
             return
-        if event.keysym in ('BackSpace', 'Escape'):
-            self._press('back')
-        elif event.char == ' ':
-            self._press(' ')
-        elif event.char and event.char.lower() in ('c', 'q'):
-            self._press(event.char.lower())
-        elif event.char and event.char.isdigit():
-            self._press(event.char)
-
-    def _on_click(self, event):
-        self.view.focus_set()
-        if self.mode == 'picker' and 'cols' in self.sess:
-            col, row = event.x // TILE_W, event.y // TILE_H
-            pos = row * self.sess['cols'] + col
-            if col < self.sess['cols'] and 0 <= pos < len(self.sess['indices']):
-                self._press(str(self.sess['indices'][pos]))
-
-    # ---------- camera discovery / picker ----------
-    def _find_cameras(self):
+        CALIB_DIR.mkdir(exist_ok=True)
+        path = filedialog.askopenfilename(initialdir=CALIB_DIR, filetypes=[("JSON", "*.json")])
+        if not path:
+            return
         try:
-            self.settings = self._settings()
-        except ValueError as e:
-            messagebox.showerror('Invalid input', str(e))
+            value = load_calibration(path)
+            if value.size != self.frame_size:
+                raise ValueError(f"Calibration resolution {value.size} does not match camera {self.frame_size}.")
+            if value.device_path and self.camera.device_path:
+                if value.device_path.casefold() != self.camera.device_path.casefold():
+                    raise ValueError("This calibration belongs to a different camera device path.")
+            elif not messagebox.askyesno(
+                "Camera identity unavailable",
+                "The saved or current camera has no device path. Cannot verify identity. Apply anyway?"
+            ):
+                return
+            maps = make_maps(value)
+        except (OSError, ValueError, cv2.error) as exc:
+            messagebox.showerror("Load calibration", str(exc))
             return
-        self.find_btn.config(state='disabled')
-        self._reset_view('Searching for cameras...')
-        self.update_idletasks()
-        indices = find_indices()
-        if not indices:
-            self._log('Error: no cameras found.')
-            self._reset_view('No cameras found. Click "Find cameras" to retry.')
-            self._set_mode('idle')
-            return
-        self.names = {i: f'cam{i}' for i in indices}
-        self.names.update({i: n for i, n in self.settings['names'].items() if i in indices})
-        self._log(f'Found cameras: {indices}')
-        self.indices = indices
-        self._start_picker()
+        self.columns.set(str(value.pattern[0]))
+        self.rows.set(str(value.pattern[1]))
+        self.calibration = value
+        self.maps = maps
+        self.result.set(f"Calibration RMS reprojection error: {value.rms:.3f} pixels")
+        self.status.set("Calibration loaded. Verify that the selected camera is correct.")
 
-    def _start_picker(self):
-        caps = open_previews(self.indices)
-        if not caps:
-            self._log('Error: could not open the cameras for preview.')
-            self._reset_view('Could not open cameras. Click "Find cameras" to retry.')
-            self._set_mode('idle')
-            return
-        self.sess = {'caps': caps, 'indices': self.indices,
-                     'cols': math.ceil(math.sqrt(len(self.indices)))}
-        self.pending_key = None
-        self._log("Click a camera (or press its number) to calibrate it.")
-        self._set_mode('picker')
-        self.after(TICK_MS, self._picker_tick)
+    def show_image(self, label, frame):
+        width = max(label.winfo_width(), 1)
+        height = max(label.winfo_height(), 1)
+        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        image.thumbnail((width, height), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        label.configure(image=photo, text="")
+        label.image = photo
 
-    def _release_picker(self):
-        for cap in self.sess.get('caps', {}).values():
-            cap.release()
-        self.sess = {}
-
-    def _picker_tick(self):
-        if self.mode != 'picker':
-            return
-        key, self.pending_key = self.pending_key, None
-        if key in ('back', 'q'):
-            self._release_picker()
-            self._set_mode('idle')
-            self._reset_view('Click "Find cameras" to begin')
-            return
-        if key and key.isdigit() and int(key) in self.indices:
-            self._release_picker()
-            self._start_calibration(int(key))
-            return
-
-        caps, cols = self.sess['caps'], self.sess['cols']
-        tiles = []
-        for i in self.indices:
-            ret, frame = caps[i].read()
-            tiles.append(make_tile(i, self.names[i], frame if ret else None, i in self.done))
-        rows = math.ceil(len(tiles) / cols)
-        tiles += [np.zeros_like(tiles[0])] * (rows * cols - len(tiles))
-        grid = np.vstack([np.hstack(tiles[r * cols:(r + 1) * cols]) for r in range(rows)])
-        self._show(grid)
-        self.after(TICK_MS, self._picker_tick)
-
-    # ---------- calibration ----------
-    def _start_calibration(self, index):
-        s = self.settings
-        board = s['board']
-        template = np.zeros((board[0] * board[1], 3), np.float32)
-        template[:, :2] = np.mgrid[0:board[0], 0:board[1]].T.reshape(-1, 2) * s['square']
-
-        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, s['width'])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, s['height'])
-        if not cap.isOpened():
-            self._log(f'Error: Could not open camera {index}.')
-            cap.release()
-            self._start_picker()
-            return
-
-        self.sess = {'cap': cap, 'index': index, 'name': self.names[index], 'template': template,
-                     'obj': [], 'img': [], 'size': None, 'last_corners': None, 'last_save': 0.0}
-        self.pending_key = None
-        self._log(f"Calibrating '{self.names[index]}' (camera {index}). Move the board around; frames save "
-                  f"automatically (target {s['frames']}).")
-        self._set_mode('calib')
-        self.after(TICK_MS, self._calib_tick)
-
-    def _save_frame(self, corners):
-        s, st = self.settings, self.sess
-        st['obj'].append(st['template'].copy())
-        st['img'].append(corners.reshape(-1, 1, 2).astype(np.float32 if s['pinhole'] else np.float64))
-        self._log(f"Saved frame {len(st['img'])}")
-
-    def _run_calibration(self):
-        s, st = self.settings, self.sess
-        if len(st['img']) < MIN_FRAMES:
-            self._log(f"Need at least {MIN_FRAMES} frames, have {len(st['img'])}.")
-            return False
-        self._log('Calibrating...')
-        self.update_idletasks()
+    def poll(self):
         try:
-            rms, K, D = calibrate(st['obj'], st['img'], st['size'], not s['pinhole'])
-        except cv2.error as e:
-            self._log(f'Calibration failed ({e}). Keep capturing more varied frames.')
-            return False
-        os.makedirs(s['out'], exist_ok=True)
-        path = os.path.join(s['out'], f"{st['name']}.npz")
-        np.savez(path, K=K, D=D, size=np.array(st['size']), fisheye=not s['pinhole'])
-        self._log(f'RMS error: {rms:.3f}px. Saved to {path}')
-        return True
+            while True:
+                self.handle_event(self.events.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            token, frame = self.worker.frames.get_nowait()
+            if token == self.token and self.camera is not None:
+                size = (frame.shape[1], frame.shape[0])
+                if self.frame_size is not None and size != self.frame_size:
+                    self.clear_state()
+                    self.status.set("Camera resolution changed; calibration and samples cleared.")
+                self.frame_size = size
+                self.frame = frame
+                if self.status.get() == "Opening camera...":
+                    self.status.set("Camera ready. Position the checkerboard and capture a view.")
+                self.show_image(self.original, frame)
+                if self.maps is not None:
+                    self.show_image(self.corrected, cv2.remap(frame, *self.maps, interpolation=cv2.INTER_LINEAR))
+        except queue.Empty:
+            pass
+        if not self.closed:
+            self.timer = self.root.after(30, self.poll)
 
-    def _end_calibration(self, result):
-        self.sess['cap'].release()
-        index = self.sess['index']
-        self.sess = {}
-        if result == 'saved':
-            self.done.add(index)
-        if result == 'quit':
-            self._set_mode('idle')
-            self._reset_view('Click "Find cameras" to begin')
-        else:
-            self._start_picker()
-
-    def _calib_tick(self):
-        if self.mode != 'calib':
+    def handle_event(self, event):
+        kind, token, *payload = event
+        if kind == "camera_error":
+            if token == self.token:
+                self.frame = None
+                self.frame_size = None
+                self.clear_state()
+                self.clear_previews()
+                self.status.set(payload[0])
+                messagebox.showerror("Camera", payload[0])
             return
-        s, st = self.settings, self.sess
-        key, self.pending_key = self.pending_key, None
-        if key == 'q':
-            self._end_calibration('quit')
+        value, error = payload
+        if kind == "discovery":
+            self.scanning = False
+            if token != self.token:
+                return
+            if error:
+                self.status.set(f"Camera discovery failed: {error}")
+                return
+            self.cameras, warning = value
+            self.dropdown["values"] = [camera.label for camera in self.cameras]
+            self.status.set((warning + " " if warning else "") + (
+                "Select a camera. Index-to-device mapping is assumed, not verified."
+                if self.cameras else "No cameras found; connect a camera and refresh."
+            ))
             return
-        if key == 'back':
-            self._end_calibration('back')
+        if token != self.generation:
             return
+        self.busy = False
+        if error:
+            self.status.set(f"{kind.capitalize()} failed: {error}")
+            messagebox.showerror(kind.capitalize(), error)
+        elif kind == "capture":
+            if value is None:
+                self.status.set("Checkerboard not detected. Ensure the entire board is visible and try again.")
+            else:
+                self.samples.append(value)
+                self.sample_status.set(f"Samples: {len(self.samples)} ({MIN_SAMPLES} minimum; 15+ recommended)")
+                self.status.set("View captured. Move and tilt the board for the next view.")
+        elif kind == "calibration":
+            try:
+                maps = make_maps(value)
+            except (ValueError, cv2.error) as exc:
+                self.status.set(f"Could not create undistortion maps: {exc}")
+                messagebox.showerror("Calibration", str(exc))
+                return
+            self.calibration = value
+            self.maps = maps
+            self.result.set(f"Calibration RMS reprojection error: {value.rms:.3f} pixels")
+            self.status.set("Calibration complete. Compare the previews and save the result.")
 
-        ret, frame = st['cap'].read()
-        if not ret:
-            self._log("Error: Can't receive frame.")
-            self._end_calibration('back')
-            return
-        size = st['size'] = (frame.shape[1], frame.shape[0])
-        corners = find_corners(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), s['board'])
-
-        now = time.time()
-        auto_saved = False
-        if corners is not None and now - st['last_save'] >= s['interval'] and (
-                st['last_corners'] is None
-                or np.linalg.norm(corners - st['last_corners'], axis=2).mean() >= s['min_move']):
-            self._save_frame(corners)
-            st['last_corners'], st['last_save'], auto_saved = corners, now, True
-
-        view = frame.copy()
-        if corners is not None:
-            cv2.drawChessboardCorners(view, s['board'], corners, True)
-        if auto_saved:
-            cv2.rectangle(view, (0, 0), (size[0] - 1, size[1] - 1), (255, 255, 255), 12)
-        status = f"{st['name']}: {len(st['img'])}/{s['frames']} frames" + ('' if corners is not None else ' (no board)')
-        cv2.putText(view, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        self._show(view)
-
-        if key == ' ' and corners is not None:
-            self._save_frame(corners)
-            st['last_corners'], st['last_save'] = corners, now
-        elif key == 'c' and self._run_calibration():
-            self._end_calibration('saved')
-            return
-        if len(st['img']) >= s['frames'] and auto_saved and self._run_calibration():
-            self._end_calibration('saved')
-            return
-        self.after(TICK_MS, self._calib_tick)
-
-    def _close(self):
-        self.mode = 'idle'
-        self._release_picker()
-        if 'cap' in self.sess:
-            self.sess['cap'].release()
-        self.destroy()
+    def close(self):
+        self.closed = True
+        self.root.after_cancel(self.timer)
+        self.worker.commands.put(("stop", None, self.token))
+        self.root.destroy()
 
 
-if __name__ == '__main__':
-    App().mainloop()
+def main():
+    root = tk.Tk()
+    root.geometry("1200x700")
+    Application(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

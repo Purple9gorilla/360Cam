@@ -34,11 +34,9 @@ python Calibration\CalibrateGUI.py
 - Sanity check: the printed RMS should be under about 1px, and the focal length should be near `(width / 2) / tan(HFOV / 2)` (about 540px for a 100° lens at 1280px wide).
 - Output: `calib\<name>.npz`.
 
-Check the result:
-```
-python Calibration\PreviewUndistort.py --camera 0 --name front
-```
-Straight real-world lines should look straight on the right-hand side.
+Check the result: after a camera finishes calibrating, the GUI automatically shows a live preview with the raw feed on the left and the undistorted feed on the right. Straight real-world lines should look straight on the right. Press Backspace to return to the grid. To preview a camera that is already calibrated, press **P** (or click **Preview undistorted**) in the grid, then click the camera.
+
+`Calibration\PreviewUndistort.py --camera 0 --name front` does the same from the command line.
 
 Redo this whenever you change the lens or the resolution.
 
@@ -76,7 +74,7 @@ Renders four simulated cameras around a virtual car looking at a tile floor.
 |---|---|
 | `Calibration\Capture.py` | Single camera live view |
 | `Calibration\MultiCapture.py` | All cameras in one grid |
-| `Calibration\CalibrateGUI.py` | Lens calibration GUI, saves frames automatically |
+| `Calibration\CalibrateGUI.py` | Fisheye lens calibration GUI (checkerboard capture, JSON output) |
 | `Calibration\PreviewUndistort.py` | Raw vs undistorted preview |
 | `Calibration\CalibrateGround.py` | Ground-plane homography per camera |
 | `BirdsEye.py` | Stitches the cameras into the live top-down view |

@@ -1,2 +1,4 @@
 opencv-python<5
 numpy
+Pillow>=10
+pygrabber>=0.2
