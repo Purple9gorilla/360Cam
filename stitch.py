@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -88,9 +89,10 @@ def check_pair(calibration, extrinsics):
 class CameraStream(threading.Thread):
     """Keeps only the newest frame from one camera."""
 
-    def __init__(self, index):
+    def __init__(self, index, size):
         super().__init__(daemon=True)
         self.index = index
+        self.size = size
         self.lock = threading.Lock()
         self.frame = None
         self.error = ""
@@ -98,18 +100,14 @@ class CameraStream(threading.Thread):
 
     def run(self):
         capture = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
-        mjpg = cv2.VideoWriter_fourcc(*"MJPG")
         try:
             if not capture.isOpened():
                 self.error = "Could not open the camera."
                 return
-            for _ in range(3):
-                capture.set(cv2.CAP_PROP_FOURCC, mjpg)
-                if int(capture.get(cv2.CAP_PROP_FOURCC)) == mjpg:
-                    break
-            else:
-                self.error = "Camera would not switch to MJPG."
-                return
+            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.size[0])
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.size[1])
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             while not self.stopping.is_set():
                 ok, frame = capture.read()
                 if not ok or frame is None:
@@ -313,19 +311,21 @@ class StitchApp:
         except (ValueError, cv2.error) as exc:
             messagebox.showerror("Start", str(exc))
             return
-        self.open_streams([rig.camera.index for rig in rigs])
+        self.open_streams(rigs)
         self.gains = None
         self.frame_count = 0
         self.running = True
         self.start_button.configure(text="Stop")
         self.status.set("Opening cameras...")
 
-    def open_streams(self, indices):
-        for index in indices:
+    def open_streams(self, rigs):
+        for rig in rigs:
+            index = rig.camera.index
             stream = self.streams.get(index)
             if stream is None or not stream.is_alive():
-                self.streams[index] = CameraStream(index)
+                self.streams[index] = CameraStream(index, rig.calibration.size)
                 self.streams[index].start()
+                time.sleep(0.25)
 
     def stop_all(self):
         for stream in self.streams.values():
