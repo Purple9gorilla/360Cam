@@ -1,87 +1,57 @@
-# 360Cam
+# Fisheye camera calibration
 
-A homemade bird's-eye (surround-view) camera system for a car. Several cameras are calibrated, warped onto the ground plane and stitched into one top-down view.
+A Windows application for calibrating a camera with a printed checkerboard using OpenCV's fisheye model. It shows the original and corrected live camera images side by side.
 
 ## Setup
 
-```
-python -m venv .venv
+Install Python with Tkinter, then in this folder run:
+
+```powershell
+py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
 ```
 
-OpenCV must stay below version 5. OpenCV 5.0's fisheye calibration is broken. Run everything with `.\.venv\Scripts\python.exe` from the project root.
+## Calibrate
 
-## Workflow
+1. Connect the camera, click **Refresh** if needed, and select it from the dropdown. The app uses the Windows DirectShow backend.
+2. Print and mount a flat checkerboard. Enter the number of **inner corners**, not squares, across and down. For example, 10 by 7 squares have 9 by 6 inner corners.
+3. Keep the whole board visible and click **Capture view** for each image. Capture at least 10 different views; 15 or more are recommended. Move and tilt the board across the image, including near its edges. Avoid blurry or repeated views.
+4. Click **Calibrate**. Check the corrected preview and reported RMS reprojection error. If calibration fails or the result looks wrong, reset and capture more varied, clear views.
+5. Click **Save** to store a JSON file. To reuse it, select the camera and click **Load**. The resolution must match. If the saved device path differs from the selected camera, or either path is missing, the app asks for confirmation before loading.
 
-### 1. Check your cameras
+## Extrinsics (camera pose on the car)
+
+Once the intrinsics are calibrated or loaded, the extrinsics give the camera's position and angle relative to the car, so views can later be stitched into a top-down image.
+
+1. Mount the camera. Lay a large checkerboard flat on the floor, using the same inner-corner counts as the intrinsics.
+2. Measure where the board's first corner (top-left, as the upright view shows it) sits, in mm from the car centre: **X** is right and **Y** is forward. The board extends right and *back* (down in the image) from that corner. Enter the printed **square** size in mm, the **origin X/Y**, and the **angle** (degrees, counter-clockwise from above).
+3. Keep the whole board visible and click **Solve extrinsics**. The result shows the reprojection RMS and the camera position and height. The **Ground view** pane shows a top-down view of the floor (700 px wide at 0.1 px/mm); the board should look square and sit where you placed it.
+4. Click **Save extrinsics** to store a JSON file, or **Load extrinsics** to reuse one. Loading needs the matching intrinsics loaded first.
+
+Redo this if the camera is moved or re-aimed. Only flat ground is modelled, so tall objects look stretched. The **view mm/px** field zooms the Ground view, which is centred on the board.
+
+**Upside-down cameras:** tick **Camera upside down** before solving. The app turns the frame 180° for detection, so measure the board's first corner as the upright view shows it. The stitcher handles the rotation automatically, and intrinsics don't need redoing. Solving fails if the result puts the camera below the floor, which usually means the corner, angle or this checkbox is wrong.
+
+## Stitch a top-down view
+
+```powershell
+.\.venv\Scripts\python.exe stitch.py
 ```
-python Calibration\MultiCapture.py
-python Calibration\Capture.py
+
+1. Click **Add camera** for each camera. In each row, pick the camera, then load its **Intrinsics** and **Extrinsics** JSON files. The extrinsics must have been solved with those intrinsics, and every row needs a different camera.
+2. Set **mm per px** (default 10), **canvas px** (square, 100 to 2000) and the **car W x L** in mm for the outline.
+3. Click **Start**. Camera resolutions must match their calibrations. Overlaps are feather-blended, and **Match brightness** evens out exposure differences where views overlap. Areas no camera sees stay black.
+4. **Snapshot** saves the current view as a PNG. **Stop** before removing a camera.
+
+Only flat ground is modelled, so tall objects smear away from the car.
+
+Changing the camera, checkerboard dimensions, or camera resolution clears the current samples and calibration. Reset clears them as well. Undistortion is unavailable until a calibration is applied. The program does not save captured images.
+
+The dropdown shows DirectShow names and Windows hardware IDs when available. Hardware IDs usually identify a model, not an individual device; the separate device instance and interface path help distinguish devices. OpenCV accesses cameras by DirectShow index. The app assumes its ordering matches Windows enumeration but cannot verify that mapping, and ordering may change when devices reconnect. Refresh and visually verify the selected camera before calibrating or loading a file; device-path checks cannot prove the identity of the camera OpenCV actually opened. Some virtual devices do not expose Windows identifiers.
+
+## Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
-`MultiCapture.py` shows every connected camera in one grid. Note which index is which position.
-
-### 2. Intrinsics (once per camera and lens)
-Corrects lens distortion. Hold a printed checkerboard in front of the camera and tilt and move it around, covering the edges and corners. Frames save automatically.
-
-```
-python Calibration\CalibrateGUI.py
-```
-- Set the options in the left panel, then click **Find cameras**. Every connected camera appears in one grid. Click a camera (or press its number key) to calibrate it. When it finishes (or you press Backspace), you return to the grid, and calibrated cameras are marked.
-- **Names** (`0=front 1=rear`) sets the output file names. Unnamed cameras are called `cam<index>`.
-- Tick **Pinhole** for lenses up to about 120°. Leave it off for real fisheye lenses (about 160–190°).
-- **Inner corners** is the number of inner checkerboard corners (default 9 × 6). **Square size** is in mm.
-- Auto-saves when the board has moved at least *Min corner movement* px and *Min seconds between saves* have passed, then calibrates after *Frames* frames (default 20). SPACE forces a save, `c` calibrates now, Backspace goes back.
-- Sanity check: the printed RMS should be under about 1px, and the focal length should be near `(width / 2) / tan(HFOV / 2)` (about 540px for a 100° lens at 1280px wide).
-- Output: `calib\<name>.npz`.
-
-Check the result: after a camera finishes calibrating, the GUI automatically shows a live preview with the raw feed on the left and the undistorted feed on the right. Straight real-world lines should look straight on the right. Press Backspace to return to the grid. To preview a camera that is already calibrated, press **P** (or click **Preview undistorted**) in the grid, then click the camera.
-
-`Calibration\PreviewUndistort.py --camera 0 --name front` does the same from the command line.
-
-Redo this whenever you change the lens or the resolution.
-
-### 3. Ground plane (once per camera, after it is mounted)
-Maps each camera's view onto the floor. Lay a large checkerboard flat on the floor at a known position.
-
-```
-python Calibration\CalibrateGround.py --camera 0 --name front --origin -400 1500 --square 100
-```
-- Coordinates are in mm from the car centre: x = right, y = forward.
-- `--origin X Y` is where the board's first corner sits. `--angle` rotates the board (degrees, counter-clockwise from above).
-- Press SPACE when the board is detected. A live top-down preview opens. The board should look square and sit where you placed it.
-- Use the same `--scale` and `--canvas-mm` for every camera.
-- Output: `calib\<name>_ground.npz`.
-
-Redo this if a camera is moved or re-aimed.
-
-### 4. Bird's-eye view
-```
-python BirdsEye.py --cam front=0 rear=1 left=2 right=3
-```
-- Press `q` to quit. `--snapshot out.png` saves one image and exits.
-- `--car-mm W L` sets the car outline size. `--no-gain` turns off brightness matching.
-- Overlaps are blended with feathered weights. Brightness between cameras is matched automatically where their views overlap.
-
-### Try it without hardware
-```
-python BirdsEye.py --simulate
-```
-Renders four simulated cameras around a virtual car looking at a tile floor.
-
-## Project layout
-
-| File | Purpose |
-|---|---|
-| `Calibration\Capture.py` | Single camera live view |
-| `Calibration\MultiCapture.py` | All cameras in one grid |
-| `Calibration\CalibrateGUI.py` | Fisheye lens calibration GUI (checkerboard capture, JSON output) |
-| `Calibration\PreviewUndistort.py` | Raw vs undistorted preview |
-| `Calibration\CalibrateGround.py` | Ground-plane homography per camera |
-| `BirdsEye.py` | Stitches the cameras into the live top-down view |
-| `Simulation.py` | Synthetic cameras for testing |
-| `calib\` | Saved calibration files |
-
-## Known limits
-
-- Narrow lenses (about 100°) leave gaps at the corners of the car. Wider lenses, or mounting the cameras higher, fill them.
-- Only flat ground is modelled. Tall objects appear stretched and smeared away from the car.
